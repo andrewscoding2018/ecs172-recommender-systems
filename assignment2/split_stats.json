@@ -1,0 +1,34 @@
+{
+  "split_policy": "per-user temporal leave-last-20%",
+  "seed": 172,
+  "n_users": 6040,
+  "n_items_total": 3706,
+  "n_items_in_movies_csv": 3883,
+  "n_train_ratings": 797758,
+  "n_test_ratings": 202451,
+  "global_mean_rating_train": 3.61684,
+  "rating_hist_train": {
+    "1": 42207,
+    "2": 81748,
+    "3": 204611,
+    "4": 280133,
+    "5": 189059
+  },
+  "rating_hist_test": {
+    "1": 13967,
+    "2": 25809,
+    "3": 56586,
+    "4": 68838,
+    "5": 37251
+  },
+  "n_cold_items_in_test": 40,
+  "n_cold_users_in_test": 0,
+  "train_timestamp_range": [
+    956703932,
+    1046106198
+  ],
+  "test_timestamp_range": [
+    956706148,
+    1046454590
+  ]
+}
