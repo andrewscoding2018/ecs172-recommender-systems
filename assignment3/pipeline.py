@@ -245,7 +245,7 @@ def build_feature_rows(
         if not cands:
             continue
 
-        # Precompute the user's token bag once per user (not per candidate).
+        # compute each user's token bag just once
         hist_tokens: set[str] = set()
         for it in hist:
             hist_tokens |= item_tokens_by_id.get(it, set())
@@ -258,11 +258,11 @@ def build_feature_rows(
             rows.append([
                 cf,                              # cf_score
                 ct,                              # content_score
-                1.0 if cf > 0 else 0.0,          # in_cf  (route provenance flag)
+                1.0 if cf > 0 else 0.0,          # in_cf  (route provenance)
                 1.0 if ct > 0 else 0.0,          # in_content
-                item_pop_log[ix],                # pop_log  (popularity prior)
-                hist_size_log,                   # hist_size_log  (user engagement)
-                float(overlap),                  # tag_overlap  (raw count, ranker can re-scale)
+                item_pop_log[ix],                # pop_log  (popularity)
+                hist_size_log,                   # hist_size_log  (engagement)
+                float(overlap),
                 item_year[ix],                   # release_year (-1 = missing)
             ])
             if truth is not None:
@@ -304,31 +304,30 @@ def eval_top10(scores, keys, truth_by_user) -> tuple[float, float]:
 
 
 # ============================================================================
-# DIAGNOSTICS — print just enough to justify each design choice
+# DIAGNOSTICS - validate that the data looks as expected
 # ============================================================================
 
 def diag_data(train: pd.DataFrame, items: pd.DataFrame, hist_len, pop) -> None:
-    print("\n[diag] Why hybrid retrieval?")
+    print("\n [Why hybrid retrieval?]")
     cold_share = 1 - len(pop) / len(items)
-    print(f"  {cold_share:.0%} of catalog has zero training interactions — item-CF cannot reach them.")
-    print(f"  -> content TF-IDF is required to even score these items.")
+    print(f"  {cold_share:.0%} of catalog is cold")
 
-    print("\n[diag] Popularity skew (why we include pop_log as a feature):")
+    print("\n[diag] popularity_skew:")
     top = pop.sort_values(ascending=False).head(5)
     top_titles = items.set_index("item_id").loc[top.index, "title"].tolist()
     for (iid, n), title in zip(top.items(), top_titles):
         print(f"  {iid}  n={n:4d}  {title}")
     print(f"  median pop={pop.median():.0f}  mean={pop.mean():.1f}  max={pop.max()}  "
-          f"-> log1p tames the long tail.")
+          f"-> log1p helps to deal with the long tail")
 
 
 def diag_cf(cf: ItemCF, items: pd.DataFrame, k: int = 5) -> None:
-    print("\n[diag] Item-CF sanity check — top co-occurring item pairs:")
-    # Pull strongest off-diagonal entries of item_sim
+    print("\n[diag] item-cf check - top co-occurring item pairs:")
+    # pull strongest off-diagonal entries of item_sim (aka top co-occuring item pairs)
     coo = cf.item_sim.tocoo()
     mask = coo.row != coo.col
     rows, cols, vals = coo.row[mask], coo.col[mask], coo.data[mask]
-    order = np.argsort(-vals)[: k * 2]  # 2x because each pair appears twice (symmetric)
+    order = np.argsort(-vals)[: k * 2]  # each pair appears twice
     seen = set()
     title_by_id = items.set_index("item_id")["title"].to_dict()
     shown = 0
@@ -342,7 +341,7 @@ def diag_cf(cf: ItemCF, items: pd.DataFrame, k: int = 5) -> None:
         shown += 1
         if shown >= k:
             break
-    print("  (If these look like obvious siblings/sequels, CF is learning real structure.)")
+    print("  (i honestly have no idea what these games are, but it looks plausable?)\n")
 
 
 def diag_content(content: ContentTFIDF, k: int = 5) -> None:
@@ -350,19 +349,19 @@ def diag_content(content: ContentTFIDF, k: int = 5) -> None:
     vocab = content.tfidf.vocabulary_
     inv_vocab = {i: w for w, i in vocab.items()}
     idfs = content.tfidf.idf_
-    # most common (low IDF) tokens — these would dominate without IDF
+    # most common tokens
     low = np.argsort(idfs)[:k]
     high = np.argsort(-idfs)[:k]
-    print(f"  Lowest-IDF tokens (most common; would swamp similarity if un-weighted):")
+    print(f"  lowest-idf token:")
     for i in low:
         print(f"    {inv_vocab[i]:30s} idf={idfs[i]:.2f}")
-    print(f"  Highest-IDF tokens (rare; most distinctive):")
+    print(f"  highest-IDF tokens(rare):")
     for i in high:
         print(f"    {inv_vocab[i]:30s} idf={idfs[i]:.2f}")
 
 
 def diag_retrieval(users, histories, cands, truth, hist_by_user) -> None:
-    print("\n[diag] Hybrid pool composition (per user, averaged):")
+    print("\n[diag] hybrid results (per user, averaged):")
     cf_only = ct_only = both = 0
     pool_sizes = []
     for c in cands:
@@ -402,22 +401,22 @@ def diag_retrieval(users, histories, cands, truth, hist_by_user) -> None:
     print(f"  {'bucket':<8}{'users':>8}{'recall':>10}")
     for label, n_u, r in rows:
         print(f"  {label:<8}{n_u:>8}{r:>10.4f}")
-    print("  -> cold users have lower recall; content route helps but doesn't fully close the gap.")
+    print("  -> cold users have lower recall, so hybrid helps but isn't perfect")
 
 
 def diag_features(X: np.ndarray, y: np.ndarray) -> None:
-    print("\n[diag] Feature means: positive vs negative class (discriminative power):")
+    print("\n[diag] positive vs negative class feature means (discriminative power):")
     print(f"  {'feature':<18}{'positive':>12}{'negative':>12}{'pos/neg':>10}")
     pos, neg = X[y == 1], X[y == 0]
     for i, name in enumerate(FEATURE_NAMES):
         p, n = pos[:, i].mean(), neg[:, i].mean()
         ratio = (p / n) if n != 0 else float("inf")
         print(f"  {name:<18}{p:>12.4f}{n:>12.4f}{ratio:>10.2f}x")
-    print("  -> ratios far from 1.0 mean the feature separates the classes.")
+    print("  -> aka, does the feature separates the classes?")
 
 
 def diag_ranker(ranker, X_eval, y_eval, rng) -> None:
-    print("\n[diag] Permutation importance (on sampled 30K eval rows, scoring=AP):")
+    print("\n[diag] permutation importance (on sampled 30K eval rows, scoring=AP):")
     n = min(30_000, len(X_eval))
     idx = rng.choice(len(X_eval), n, replace=False)
     result = permutation_importance(
@@ -454,7 +453,7 @@ def main() -> None:
     rng = np.random.default_rng(SEED)
 
     # --------------------------------------------------------------------
-    # 1. Load + sanity-check the data
+    # 1. load and check data
     # --------------------------------------------------------------------
     print("\n=== 1. Load data ===")
     train = pd.read_csv(DATA_DIR / "train.csv")
@@ -471,7 +470,7 @@ def main() -> None:
     diag_data(train, items, hist_len, pop)
 
     # --------------------------------------------------------------------
-    # 2. Validation split — mirror the leaderboard's last-5-per-user holdout
+    # 2. validation split (like the leaderboard)
     # --------------------------------------------------------------------
     print("\n=== 2. Validation split (last-5 per user) ===")
     eligible = hist_len[hist_len >= KEEP_LAST_N + MIN_TRAIN_AFTER_HOLDOUT].index
@@ -610,7 +609,7 @@ def main() -> None:
     for (u, it), s in zip(k_test, proba_test):
         by_user_scores.setdefault(u, []).append((it, float(s)))
 
-    # Popularity fallback for users where retrieval came up < 10 candidates
+    # fallback on popularity for users where retrieval came up < 10 candidates
     fallback = pop_full.sort_values(ascending=False).index.tolist()
     rows = []
     fallback_used = 0
@@ -656,7 +655,7 @@ def main() -> None:
     assert not overlap.any(), f"{int(overlap.sum())} predictions are owned by the user"
 
     submission.to_csv(SUBMISSION_PATH, index=False)
-    print(f"wrote {SUBMISSION_PATH.name}: {submission.shape}  (all format checks passed)")
+    print(f"wrote {SUBMISSION_PATH.name}: {submission.shape}")
 
 
 if __name__ == "__main__":
