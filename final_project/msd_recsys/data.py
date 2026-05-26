@@ -53,12 +53,24 @@ def load_user_list(path: str | Path) -> list[str]:
 
 
 def load_song_to_track(path: str | Path) -> pd.DataFrame:
-    """Load taste_profile_song_to_tracks.txt — song_id -> track_id mapping."""
-    return pd.read_csv(
-        path, sep="\t", header=None,
-        names=["song_id", "track_id"],
-        dtype={"song_id": "string", "track_id": "string"},
-    )
+    """Load taste_profile_song_to_tracks.txt — song_id -> track_id mapping.
+
+    Real format is variable-width:
+        song_id<TAB>track_id_1[<TAB>track_id_2[<TAB>...]]
+    because one song_id can map to multiple MSD track_ids (different versions
+    of the same song). Returns long-format: one row per (song_id, track_id) pair.
+    """
+    rows = []
+    with open(path) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2:
+                continue
+            song_id = parts[0]
+            for track_id in parts[1:]:
+                if track_id:
+                    rows.append((song_id, track_id))
+    return pd.DataFrame(rows, columns=["song_id", "track_id"]).astype("string")
 
 
 # Columns we expect from track_metadata.db. Confirm against your DB; the official
