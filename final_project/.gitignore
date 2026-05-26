@@ -1,0 +1,16 @@
+# Python build / env artifacts
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Data + model artifacts (live in Drive, not git)
+data/
+checkpoints/
+*.pkl
+
+# Local submission outputs
+submission*.csv
