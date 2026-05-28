@@ -210,46 +210,119 @@ class SemanticIDRetriever:
         already_owned: list[set[str]] | None = None,
         batch: int = 256,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Score every catalog item against each user's code bag; return top_k per user."""
+        """Score every catalog item against each user's code bag; return top_k per user.
+
+        High level: for each user, sum the discrete-code one-hots of items in their
+        history to form a "code bag" profile, then score every catalog item by how
+        many code positions it shares with that profile. Top-k by score is the
+        retrieval output.
+
+        Args:
+            histories: one list of item_ids per user (their visible listening history).
+            top_k: number of candidates to return per user.
+            already_owned: optional per-user set of item_ids to exclude from results
+                (e.g., songs the user has already played — we don't want to recommend them).
+            batch: number of users scored per inner loop iteration. Bigger = faster
+                but more memory for the dense (batch x n_items) score matrix.
+
+        Returns:
+            out_ids: (n_users, top_k) object array of item_ids, ranked best->worst.
+            out_sc:  (n_users, top_k) float32 array of matching scores.
+        """
+        # Must have fit() before scoring — that's where item_code_matrix is built.
         assert self.item_code_matrix is not None, "call fit() first"
-        n = len(histories)
-        n_items = self.item_code_matrix.shape[0]
+
+        n = len(histories)                          # number of users to score
+        n_items = self.item_code_matrix.shape[0]    # full catalog size
+
+        # Pre-transpose the item-code matrix once. We'll do `profiles @ item_codes_T`
+        # later; having the transpose in CSR form makes that matmul efficient.
+        # Shape: (n_total_codes, n_items)
         item_codes_T = self.item_code_matrix.T.tocsr()
 
-        # Build (n_users x n_codes) profile = sum of code-onehot vectors over history items.
+        # ------------------------------------------------------------------
+        # PHASE 1: build the per-user "code bag" profile matrix.
+        #
+        # Each user gets a length-n_total_codes vector. Position c counts how many
+        # times code c appears across the items in their history. We're building this
+        # as a sparse CSR by collecting (row, col, value) triplets and constructing
+        # the matrix in one shot at the end — much faster than incrementally building.
+        # ------------------------------------------------------------------
         rows, cols, data = [], [], []
         for ui_, hist in enumerate(histories):
+            # Map this user's history item_ids -> row indices into item_code_matrix.
+            # Drop any items not in our catalog (shouldn't happen if data is clean,
+            # but defensive against weird edge cases).
             ixs = [self._item_to_ix[h] for h in hist if h in self._item_to_ix]
             if not ixs:
-                continue
-            sub = self.item_code_matrix[ixs].sum(axis=0)  # (1, n_codes), dense matrix
-            sub = np.asarray(sub).ravel()
+                continue  # user has zero in-catalog history — leave their profile row empty
+
+            # Sum the one-hot code vectors of all history items.
+            # Result is a (1, n_codes) sparse-row sum, materialized as a numpy matrix
+            # because scipy returns matrix subclass here.
+            sub = self.item_code_matrix[ixs].sum(axis=0)
+            sub = np.asarray(sub).ravel()           # flatten matrix -> 1D array
+
+            # Record only the nonzero entries (sparse storage). Building a Python
+            # list of triplets is the fast path for sparse matrix construction.
             nz = np.nonzero(sub)[0]
             for c in nz:
-                rows.append(ui_); cols.append(c); data.append(float(sub[c]))
+                rows.append(ui_)
+                cols.append(c)
+                data.append(float(sub[c]))
+
+        # Construct the full (n_users, n_total_codes) sparse profile matrix at once.
         profiles = csr_matrix(
             (np.asarray(data, dtype=np.float32), (rows, cols)),
             shape=(n, self._n_total_codes),
         )
 
+        # ------------------------------------------------------------------
+        # PHASE 2: score every (user, item) pair, mask owned items, take top-k.
+        #
+        # We process users in batches because the score matrix (batch x n_items) is
+        # dense — for 256 users x ~1M items x 4 bytes that's already ~1 GB. Doing
+        # it all at once would OOM on most machines.
+        # ------------------------------------------------------------------
+
+        # Pre-allocate output arrays so we write in place instead of appending.
         out_ids = np.empty((n, top_k), dtype=object)
         out_sc = np.zeros((n, top_k), dtype=np.float32)
+
         for s in range(0, n, batch):
-            e = min(s + batch, n)
-            scores = (profiles[s:e] @ item_codes_T).toarray()  # (b, n_items)
+            e = min(s + batch, n)  # batch covers users [s, e)
+
+            # Sparse @ sparse matmul -> sparse result; .toarray() densifies it for
+            # the subsequent masking + argpartition (those want dense input).
+            # Each entry (i, j) = # code positions that match between user i's
+            # profile and item j's code vector.
+            scores = (profiles[s:e] @ item_codes_T).toarray()  # shape (batch, n_items)
+
+            # Mask items the user already owns by setting their scores to -inf —
+            # argpartition will then never pick them as top-k. We do this per-user
+            # inside the batch because each user has a different owned set.
             if already_owned is not None:
                 for i, owned in enumerate(already_owned[s:e]):
+                    # Map owned item_ids -> column indices; ignore any not in catalog.
                     mask = [self._item_to_ix[o] for o in owned if o in self._item_to_ix]
                     if mask:
                         scores[i, mask] = -np.inf
+
+            # Top-k selection. argpartition(-scores, k-1) gives the indices of the k
+            # largest scores per row in O(n_items), unordered. We then sort just
+            # those k indices to get a properly ranked top-k list.
             k = min(top_k, n_items)
-            part = np.argpartition(-scores, k - 1, axis=1)[:, :k]
+            part = np.argpartition(-scores, k - 1, axis=1)[:, :k]  # (batch, k) unordered
+
+            # Per-user: sort the k candidates by score (descending), then write the
+            # ranked item_ids and scores into the pre-allocated output arrays.
             for i in range(e - s):
-                row = part[i]
-                order = np.argsort(-scores[i, row])
-                ranked = row[order]
+                row = part[i]                              # k unordered column indices
+                order = np.argsort(-scores[i, row])        # sort those k by score desc
+                ranked = row[order]                        # final ranked column indices
                 out_ids[s + i, :k] = self.all_items[ranked]
                 out_sc[s + i, :k] = scores[i, ranked]
+
         return out_ids, out_sc
 
 
