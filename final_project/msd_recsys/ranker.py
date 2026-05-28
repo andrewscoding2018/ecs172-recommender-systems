@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
+
+from .retrieval import _mb
 
 # lightgbm needs libomp.dylib on macOS; be tolerant of native-library load failures
 # so the rest of the library still imports (LightGBM is only needed at ranker-train time).
@@ -86,32 +89,56 @@ def train_lambdarank(
 def rank_candidates(
     model: Any,
     X: np.ndarray,
-    keys: list[tuple[str, str]],
+    keys: pd.DataFrame,
     *,
+    users: list[str],
+    item_ids: np.ndarray,
     top_k: int = 500,
     exclude_owned: dict[str, set] | None = None,
+    verbose: bool = False,
 ) -> dict[str, list[str]]:
     """Score with the ranker, group by user, return top-K item_ids per user.
 
-    Optionally excludes items the user already owns (default behavior in MSD
-    where you must not recommend already-listened songs).
-    """
-    scores = model.predict(X)
-    by_user: dict[str, list[tuple[str, float]]] = {}
-    for (u, it), s in zip(keys, scores):
-        by_user.setdefault(u, []).append((it, float(s)))
+    Now expects DataFrame keys (user_idx, item_ix) from build_feature_rows,
+    not the old list of (user_id, item_id) tuples. The int-indexed format is
+    ~10x smaller in memory.
 
+    Args:
+        model:         trained ranker (lightgbm).
+        X:             (n_pairs, n_features) feature matrix.
+        keys:          pd.DataFrame[user_idx, item_ix] aligned with X rows.
+        users:         list[user_id] indexed by user_idx for the final dict keys.
+        item_ids:      np.ndarray mapping item_ix -> song_id (e.g., item_table.item_ids).
+        top_k:         number of picks per user.
+        exclude_owned: optional {user_id: set[song_id]} of items to skip.
+        verbose:       print scoring + memory diagnostics.
+    """
+    scores = model.predict(X).astype(np.float32)
+
+    # Build a single working DataFrame: (user_idx, item_ix, score). Sort by
+    # user then score-desc — groupby on a sorted column is fast.
+    df = keys.copy()
+    df["score"] = scores
+    df = df.sort_values(["user_idx", "score"], ascending=[True, False], kind="stable")
+
+    if verbose:
+        print(f"[rank_candidates] working frame: {len(df):,} rows ({_mb(df):.1f} MB)")
+
+    # Per-user top-K with optional owned-set exclusion. The inner loop runs
+    # in C (groupby.apply on a sorted frame is fast), but the dict-of-strings
+    # output is the materialization the rest of the eval pipeline expects.
+    item_ids_arr = np.asarray(item_ids, dtype=object)
     out: dict[str, list[str]] = {}
-    for u, lst in by_user.items():
-        lst.sort(key=lambda x: -x[1])
-        owned = exclude_owned.get(u, set()) if exclude_owned else set()
-        picks, seen = [], set()
-        for it, _ in lst:
-            if it in owned or it in seen:
+    for user_idx, grp in df.groupby("user_idx", sort=True):
+        user_id = users[int(user_idx)]
+        owned = exclude_owned.get(user_id, set()) if exclude_owned else set()
+        picks: list[str] = []
+        for ix in grp["item_ix"].values:
+            song_id = item_ids_arr[ix]
+            if song_id in owned:
                 continue
-            picks.append(it)
-            seen.add(it)
+            picks.append(song_id)
             if len(picks) == top_k:
                 break
-        out[u] = picks
+        out[user_id] = picks
     return out

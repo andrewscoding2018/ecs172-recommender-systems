@@ -7,8 +7,9 @@ Two complementary retrievers with a shared interface, union into a hybrid pool:
     metadata + categorical buckets). Reaches the full catalog, including cold
     songs ALS can't see.
 
-Both expose recommend_batch(user_indices, top_k) -> (ids, scores) so a third
-retriever (e.g., audio-based) can drop in later without changing the caller.
+Both expose recommend_batch(user_indices, top_k) -> (ids, scores) where `ids`
+is int32 indices into the retriever's internal item space. Map to canonical
+item_ids via self.ix_to_item / self.all_items as needed.
 """
 from __future__ import annotations
 
@@ -17,6 +18,28 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
+
+
+# ---------------------------------------------------------------------------
+# Memory accounting helper — exported so features.py / ranker.py can use it.
+# ---------------------------------------------------------------------------
+
+def _mb(obj) -> float:
+    """Approximate memory footprint of obj in MB.
+
+    Handles numpy arrays, scipy CSR matrices, pandas DataFrames/Series, and
+    plain dicts (rough estimate). Returns 0 for unknown types.
+    """
+    if isinstance(obj, np.ndarray):
+        return obj.nbytes / 1e6
+    if isinstance(obj, csr_matrix):
+        return (obj.data.nbytes + obj.indices.nbytes + obj.indptr.nbytes) / 1e6
+    if isinstance(obj, (pd.DataFrame, pd.Series)):
+        return obj.memory_usage(deep=True).sum() / 1e6 if hasattr(obj, "memory_usage") else 0.0
+    if isinstance(obj, dict):
+        # rough estimate — pandas overhead per dict entry ~150 bytes
+        return len(obj) * 150 / 1e6
+    return 0.0
 
 
 # ============================================================================
@@ -71,6 +94,7 @@ class ALSRetriever:
         top_k: int = 2000,
         user_indices: np.ndarray | None = None,
         filter_already_liked: bool = True,
+        verbose: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Recommend top_k items for each user.
 
@@ -79,8 +103,16 @@ class ALSRetriever:
                        already-liked items).
             user_indices: which row indices to score. None = all users.
             top_k: number of items per user.
+            verbose: print memory + shape diagnostics for the output arrays.
 
-        Returns (item_ids_per_user, scores_per_user) with shape (n_users, top_k).
+        Returns:
+            item_ix: (n_users, top_k) int32 array of item indices in *this*
+                     retriever's space. Map to song_id via self.ix_to_item[ix].
+            scores:  (n_users, top_k) float32 array.
+
+        Note: returning int32 indices instead of an object array of song_id
+        strings saves ~20x memory (4 bytes/cell vs ~80 bytes/cell for Python
+        strings). Caller maps back to song_id only when needed.
         """
         if user_indices is None:
             user_indices = np.arange(ui_matrix.shape[0])
@@ -90,9 +122,12 @@ class ALSRetriever:
             N=top_k,
             filter_already_liked_items=filter_already_liked,
         )
-        # ids are column indices into the item space; map back to item_ids
-        out_ids = self.ix_to_item[ids]
-        return out_ids, scores
+        out_ids = np.asarray(ids, dtype=np.int32)
+        out_scores = np.asarray(scores, dtype=np.float32)
+        if verbose:
+            print(f"[ALS.recommend_batch] ids {out_ids.shape} ({_mb(out_ids):.1f} MB)  "
+                  f"scores {out_scores.shape} ({_mb(out_scores):.1f} MB)")
+        return out_ids, out_scores
 
 
 # ============================================================================
@@ -209,6 +244,7 @@ class SemanticIDRetriever:
         top_k: int = 2000,
         already_owned: list[set[str]] | None = None,
         batch: int = 256,
+        verbose: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Score every catalog item against each user's code bag; return top_k per user.
 
@@ -224,9 +260,11 @@ class SemanticIDRetriever:
                 (e.g., songs the user has already played — we don't want to recommend them).
             batch: number of users scored per inner loop iteration. Bigger = faster
                 but more memory for the dense (batch x n_items) score matrix.
+            verbose: print memory + shape diagnostics for the output arrays.
 
         Returns:
-            out_ids: (n_users, top_k) object array of item_ids, ranked best->worst.
+            out_ids: (n_users, top_k) int32 array of item indices into self.all_items.
+                     Map to song_id via self.all_items[idx] when needed.
             out_sc:  (n_users, top_k) float32 array of matching scores.
         """
         # Must have fit() before scoring — that's where item_code_matrix is built.
@@ -286,7 +324,9 @@ class SemanticIDRetriever:
         # ------------------------------------------------------------------
 
         # Pre-allocate output arrays so we write in place instead of appending.
-        out_ids = np.empty((n, top_k), dtype=object)
+        # int32 instead of object: 4 bytes/cell vs ~80 bytes/cell for Python strings.
+        # Caller maps these column indices back to song_ids via self.all_items[ix].
+        out_ids = np.empty((n, top_k), dtype=np.int32)
         out_sc = np.zeros((n, top_k), dtype=np.float32)
 
         for s in range(0, n, batch):
@@ -315,14 +355,19 @@ class SemanticIDRetriever:
             part = np.argpartition(-scores, k - 1, axis=1)[:, :k]  # (batch, k) unordered
 
             # Per-user: sort the k candidates by score (descending), then write the
-            # ranked item_ids and scores into the pre-allocated output arrays.
+            # ranked indices and scores into the pre-allocated output arrays.
+            # We store column indices (int32), NOT song_ids — caller can map
+            # to song_id via self.all_items[idx] when needed.
             for i in range(e - s):
                 row = part[i]                              # k unordered column indices
                 order = np.argsort(-scores[i, row])        # sort those k by score desc
                 ranked = row[order]                        # final ranked column indices
-                out_ids[s + i, :k] = self.all_items[ranked]
+                out_ids[s + i, :k] = ranked
                 out_sc[s + i, :k] = scores[i, ranked]
 
+        if verbose:
+            print(f"[SID.recommend_for_histories] ids {out_ids.shape} ({_mb(out_ids):.1f} MB)  "
+                  f"scores {out_sc.shape} ({_mb(out_sc):.1f} MB)")
         return out_ids, out_sc
 
 
@@ -331,30 +376,91 @@ class SemanticIDRetriever:
 # ============================================================================
 
 def build_candidate_pool(
-    als_ids: np.ndarray, als_sc: np.ndarray,
-    sid_ids: np.ndarray, sid_sc: np.ndarray,
-) -> list[dict[str, list[float]]]:
-    """Union ALS + semantic-ID top-K per user.
+    als_ids: np.ndarray,
+    als_sc: np.ndarray,
+    als_ix_to_item: np.ndarray,
+    sid_ids: np.ndarray,
+    sid_sc: np.ndarray,
+    sid_ix_to_item: np.ndarray,
+    canonical_item_to_ix: dict[str, int],
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Union ALS + semantic-ID top-K into a long-format candidate DataFrame.
 
-    Returns one dict per user: {item_id: [als_score, semantic_score]}.
-    Score is 0.0 if that route didn't surface the candidate (preserves provenance).
+    Replaces the old list-of-dicts representation, which was the OOM culprit
+    (~250 bytes per Python dict entry × millions of entries). The long-format
+    DataFrame is ~10x smaller in memory and lets downstream feature engineering
+    run vectorized instead of in a Python loop.
+
+    The two retrievers operate in different internal item-index spaces, so we
+    normalize to a single canonical space (typically the ItemFeatureTable's
+    item_ids array, i.e., the full metadata catalog).
+
+    Args:
+        als_ids:             (n_users, top_k_als) int32 — ALS-internal item indices.
+        als_sc:              (n_users, top_k_als) float32 — ALS scores.
+        als_ix_to_item:      np.ndarray mapping ALS-internal index -> song_id.
+        sid_ids:             (n_users, top_k_sid) int32 — SID-internal item indices.
+        sid_sc:              (n_users, top_k_sid) float32 — SID scores.
+        sid_ix_to_item:      np.ndarray mapping SID-internal index -> song_id.
+        canonical_item_to_ix: dict song_id -> canonical item index (shared space).
+        verbose:             print memory diagnostics.
+
+    Returns:
+        pd.DataFrame with columns:
+            user_idx (int32):   0..n_users-1, position in the input user list
+            item_ix (int32):    canonical item index
+            als_score (float32): 0.0 if ALS didn't surface this candidate
+            sid_score (float32): 0.0 if SID didn't surface this candidate
+        One row per (user, candidate item). Items surfaced by both routes get
+        a single row with both scores populated (outer-merge semantics).
     """
-    n = len(als_ids)
-    out = []
-    for i in range(n):
-        d: dict[str, list[float]] = {}
-        for j in range(als_ids.shape[1]):
-            it = als_ids[i, j]
-            if it is None or (isinstance(it, float) and np.isnan(it)):
-                continue
-            d[it] = [float(als_sc[i, j]), 0.0]
-        for j in range(sid_ids.shape[1]):
-            it = sid_ids[i, j]
-            if it is None or (isinstance(it, float) and np.isnan(it)):
-                continue
-            if it in d:
-                d[it][1] = float(sid_sc[i, j])
-            else:
-                d[it] = [0.0, float(sid_sc[i, j])]
-        out.append(d)
-    return out
+    n = als_ids.shape[0]
+    top_als = als_ids.shape[1]
+    top_sid = sid_ids.shape[1]
+
+    # Map a (n_users, top_k) int-index array to flat long-format with canonical
+    # item indices. Drops candidates whose song_id isn't in the canonical map.
+    def _flatten(retr_ids, retr_sc, retr_ix_to_item, score_col):
+        user_flat = np.repeat(np.arange(n, dtype=np.int32), retr_ids.shape[1])
+        song_flat = retr_ix_to_item[retr_ids.ravel()]   # object array of song_ids
+        # Vectorized song_id -> canonical_ix via pandas Series.map (C-level dict lookup).
+        # Items not in canonical map become NaN -> -1 after fillna.
+        canon = (
+            pd.Series(song_flat)
+            .map(canonical_item_to_ix)
+            .fillna(-1)
+            .astype(np.int32)
+            .values
+        )
+        keep = canon >= 0
+        return pd.DataFrame({
+            "user_idx": user_flat[keep],
+            "item_ix": canon[keep],
+            score_col: retr_sc.ravel()[keep].astype(np.float32),
+        })
+
+    df_als = _flatten(als_ids, als_sc, als_ix_to_item, "als_score")
+    df_sid = _flatten(sid_ids, sid_sc, sid_ix_to_item, "sid_score")
+
+    if verbose:
+        print(f"[pool] als flat: {len(df_als):,} rows ({_mb(df_als):.1f} MB)")
+        print(f"[pool] sid flat: {len(df_sid):,} rows ({_mb(df_sid):.1f} MB)")
+
+    # Outer merge — items surfaced by either route get a row; missing scores
+    # become NaN, which we fill with 0.0 (= "this route didn't surface it").
+    pool = (
+        df_als.merge(df_sid, on=["user_idx", "item_ix"], how="outer")
+              .fillna({"als_score": 0.0, "sid_score": 0.0})
+    )
+    # Ensure dtypes survive the merge
+    pool["user_idx"] = pool["user_idx"].astype(np.int32)
+    pool["item_ix"] = pool["item_ix"].astype(np.int32)
+    pool["als_score"] = pool["als_score"].astype(np.float32)
+    pool["sid_score"] = pool["sid_score"].astype(np.float32)
+
+    if verbose:
+        print(f"[pool] hybrid pool: {len(pool):,} rows ({_mb(pool):.1f} MB)  "
+              f"avg {len(pool) / n:.1f} candidates/user")
+
+    return pool
